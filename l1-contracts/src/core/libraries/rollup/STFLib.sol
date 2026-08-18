@@ -131,7 +131,7 @@ library STFLib {
         payloadDigest: bytes32(0),
         slotNumber: Slot.wrap(0),
         feeHeader: FeeHeader({
-          excessMana: 0, manaUsed: 0, ethPerFeeAsset: _initialEthPerFeeAsset, congestionCost: 0, proverCost: 0
+          excessMana: 0, manaUsed: 0, ethPerFeeAsset: _initialEthPerFeeAsset, protocolFee: 0, proverCost: 0
         })
       }).compress();
   }
