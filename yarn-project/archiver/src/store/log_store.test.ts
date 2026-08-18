@@ -595,6 +595,60 @@ describe('LogStore', () => {
     });
   });
 
+  describe('self-anchored queries (no referenceBlock)', () => {
+    const tag = new SiloedTag(new Fr(0x5e1f));
+
+    /** Seeds `count` chained single-tx blocks whose only private log carries `tag`, and returns them. */
+    async function seedTaggedChain(count: number) {
+      const ckpts = await buildChainedCheckpointsWithLogs(count, {
+        numTxsPerBlock: 1,
+        privateLogs: { numLogsPerTx: 1 },
+      });
+      for (const ckpt of ckpts) {
+        ckpt.checkpoint.blocks[0].body.txEffects[0].privateLogs[0].fields[0] = tag.value;
+      }
+      const blocks = ckpts.map(c => c.checkpoint.blocks[0]);
+      await blockStore.addCheckpoints(ckpts);
+      await logStore.addLogs(blocks);
+      return blocks;
+    }
+
+    it('returns every log up to the chain tip', async () => {
+      await seedTaggedChain(3);
+
+      const [res] = await logStore.getPrivateLogsByTags({ tags: [tag] });
+      expect(res.map(l => l.blockNumber)).toEqual([BlockNumber(1), BlockNumber(2), BlockNumber(3)]);
+    });
+
+    it('returns empty on a store with no blocks to anchor on', async () => {
+      const [res] = await logStore.getPrivateLogsByTags({ tags: [tag] });
+      expect(res).toEqual([]);
+    });
+
+    it('retries against the new tip instead of throwing when a reorg unwinds the anchor mid-query', async () => {
+      const blocks = await seedTaggedChain(3);
+
+      // Drop the tip block during the first attempt, from inside the effects fetch the query runs after its scans
+      // and before it re-checks its anchor. That attempt is anchored to a block that no longer exists, so it must be
+      // discarded and re-run against the new tip rather than returned or turned into an error.
+      let reorgs = 0;
+      const getEffects = blockStore.getNoteHashesAndNullifiers.bind(blockStore);
+      const spy = jest.spyOn(blockStore, 'getNoteHashesAndNullifiers').mockImplementation(async txHashes => {
+        if (reorgs === 0) {
+          reorgs++;
+          await blockStore.removeBlocksAfter(BlockNumber(2));
+          await logStore.deleteLogs([blocks[2]]);
+        }
+        return getEffects(txHashes);
+      });
+
+      const [res] = await logStore.getPrivateLogsByTags({ tags: [tag], includeEffects: true });
+      expect(res.map(l => l.blockNumber)).toEqual([BlockNumber(1), BlockNumber(2)]);
+      expect(reorgs).toBe(1);
+      spy.mockRestore();
+    });
+  });
+
   describe('getPrivateLogsForBlock / getPublicLogsForBlock', () => {
     it('returns all private and public logs indexed for a block in the same order they were written', async () => {
       // 2 txs * (2 private + 2 public) per block; the secondary index records every write for this block.

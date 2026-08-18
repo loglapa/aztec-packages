@@ -33,6 +33,17 @@ import {
 /** How many per-tag range scans a single tag query runs concurrently. */
 const TAG_SCAN_CONCURRENCY = 8;
 
+/** How many times a self-anchored tag query is re-run from scratch when a reorg unwinds its anchor mid-query. */
+const SELF_ANCHOR_MAX_ATTEMPTS = 3;
+
+/** Block a tag query is pinned to: every scan stops at it, and it is re-checked once the scans are done. */
+type QueryAnchor = {
+  /** Inclusive upper block bound for the query. */
+  blockNumber: number;
+  /** Hash to re-check after the scans, or undefined for an anchor no reorg can unwind (genesis). */
+  hash: BlockHash | undefined;
+};
+
 /**
  * Indexes every emitted private and public log under a composite hex-string key
  * `[contractAddress (public only)]-tag-blockNumber-txIndexWithinBlock-logIndexWithinTx`,
@@ -50,10 +61,15 @@ const TAG_SCAN_CONCURRENCY = 8;
  *
  * Tag queries deliberately run outside `db.transactionAsync`: on lmdb-v2 that helper routes its callback through the
  * store's single serial writer queue, so wrapping a pure read there serializes every concurrent query behind every
- * other query and behind block ingestion. Instead the queries rely on `query.referenceBlock` for consistency — the
- * reference block is resolved before the scans and re-checked afterwards, so a reorg landing mid-query surfaces as the
- * same "reference block not found" error the caller already handles rather than as a torn result. Queries submitted
- * without a `referenceBlock` get no such guarantee and may observe a partially applied reorg.
+ * other query and behind block ingestion. Consistency instead comes from anchoring every query to a single block: the
+ * anchor is resolved before the scans, caps them all, and is re-checked afterwards, so a reorg landing mid-query is
+ * detected rather than returned as a torn result.
+ *
+ * The anchor is `query.referenceBlock` when the caller supplies one, and the current chain tip otherwise. A
+ * self-anchored query therefore excludes logs from blocks that land while it runs, and if its anchor is unwound
+ * mid-query it silently re-runs against the new tip ({@link SELF_ANCHOR_MAX_ATTEMPTS} attempts) instead of surfacing a
+ * reorg error the caller never asked for. A caller-supplied anchor cannot be re-chosen on the caller's behalf, so a
+ * torn read there still throws the same "reference block not found" error a missing anchor produces up front.
  */
 export class LogStore {
   /** Primary map: composite private key (tag + tail = 96 hex chars + separators) -> serialized {@link StoredLogValue}. */
@@ -216,34 +232,72 @@ export class LogStore {
   }
 
   async #runQuery(query: PrivateLogsQuery | PublicLogsQuery, contractHex: string | undefined): Promise<LogResult[][]> {
+    const maxAttempts = query.referenceBlock ? 1 : SELF_ANCHOR_MAX_ATTEMPTS;
+    let anchor: QueryAnchor | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      anchor = await this.#resolveQueryAnchor(query);
+      const results = await this.#runQueryAttempt(query, contractHex, anchor);
+      if (results) {
+        return results;
+      }
+      this.#log.debug('Tag query anchor was unwound mid-query, retrying', {
+        attempt,
+        maxAttempts,
+        anchorBlockNumber: anchor?.blockNumber,
+        anchorBlockHash: anchor?.hash?.toString(),
+      });
+    }
+    if (query.referenceBlock) {
+      throw LogStore.#referenceBlockNotFoundError(query.referenceBlock);
+    }
+    throw new Error(
+      `Could not anchor tag log query after ${maxAttempts} attempts. This might indicate a reorg has occurred.`,
+    );
+  }
+
+  /**
+   * Picks the block this query is anchored to: the caller's `referenceBlock` if given, the current chain tip
+   * otherwise. Returns undefined only when the store holds no blocks, in which case there are no logs to tear.
+   */
+  async #resolveQueryAnchor(query: PrivateLogsQuery | PublicLogsQuery): Promise<QueryAnchor | undefined> {
+    if (query.referenceBlock) {
+      // The genesis block is a valid anchor during early sync but is synthetic and never indexed in the block store,
+      // so resolve it directly to the genesis block number rather than mistaking it for a reorg. No reorg can unwind
+      // it, so it needs no post-scan re-check.
+      if (query.referenceBlock.equals(this.genesisBlockHash)) {
+        return { blockNumber: INITIAL_L2_BLOCK_NUM - 1, hash: undefined };
+      }
+      return {
+        blockNumber: await this.#resolveReferenceBlockNumber(query.referenceBlock),
+        hash: query.referenceBlock,
+      };
+    }
+    const tip = await this.blockStore.getLatestBlockTip();
+    return tip && { blockNumber: tip.blockNumber, hash: tip.blockHash };
+  }
+
+  /**
+   * Runs every per-tag scan for the query against the given anchor. Returns undefined if the anchor was unwound while
+   * the scans were running, meaning the results may be torn and the query has to be discarded.
+   */
+  async #runQueryAttempt(
+    query: PrivateLogsQuery | PublicLogsQuery,
+    contractHex: string | undefined,
+    anchor: QueryAnchor | undefined,
+  ): Promise<LogResult[][] | undefined> {
     const isPublic = contractHex !== undefined;
     const tags = (query.tags as ReadonlyArray<TagQuery<Tag | SiloedTag>>) ?? [];
     const primaryMap = isPublic ? this.#publicLogs : this.#privateLogs;
 
-    // referenceBlock reorg check against the same db the log primary maps live on. The genesis block is a valid
-    // anchor during early sync but is synthetic and never indexed in the block store, so resolve it directly to the
-    // genesis block number rather than mistaking it for a reorg.
-    let referenceBlockNumber: number | undefined;
-    // Only a non-genesis anchor can be unwound by a reorg, so only that one needs the post-scan re-check.
-    let recheckReferenceBlock = false;
-    if (query.referenceBlock) {
-      if (query.referenceBlock.equals(this.genesisBlockHash)) {
-        referenceBlockNumber = INITIAL_L2_BLOCK_NUM - 1;
-      } else {
-        referenceBlockNumber = await this.#resolveReferenceBlockNumber(query.referenceBlock);
-        recheckReferenceBlock = true;
-      }
-    }
-
-    // Compute the exclusive upper-block bound across `toBlock` and `referenceBlock`.
-    // `toBlock` is already exclusive; `referenceBlock` caps inclusively, so its exclusive form is +1.
+    // Compute the exclusive upper-block bound across `toBlock` and the anchor.
+    // `toBlock` is already exclusive; the anchor caps inclusively, so its exclusive form is +1.
     let upperExclusive: number | undefined;
     if (query.toBlock !== undefined) {
       upperExclusive = query.toBlock;
     }
-    if (referenceBlockNumber !== undefined) {
-      const refExclusive = referenceBlockNumber + 1;
-      upperExclusive = upperExclusive === undefined ? refExclusive : Math.min(upperExclusive, refExclusive);
+    if (anchor !== undefined) {
+      const anchorExclusive = anchor.blockNumber + 1;
+      upperExclusive = upperExclusive === undefined ? anchorExclusive : Math.min(upperExclusive, anchorExclusive);
     }
 
     // Resolve txHash -> (blockNumber, txIndexInBlock) once for the whole query.
@@ -325,15 +379,12 @@ export class LogStore {
       }
     }
 
-    // The scans above are not atomic with respect to a concurrent reorg, so re-resolve the anchor now. If it was
-    // unwound (or landed at a different height) while we were reading, the result may be torn and we report the same
-    // reorg error a missing anchor would have produced up front.
-    if (recheckReferenceBlock && query.referenceBlock) {
-      const currentNumber = await this.#resolveReferenceBlockNumber(query.referenceBlock);
-      if (currentNumber !== referenceBlockNumber) {
-        throw new Error(
-          `Reference block ${query.referenceBlock.toString()} not found in the node. This might indicate a reorg has occurred.`,
-        );
+    // The scans above are not atomic with respect to a concurrent reorg, so re-check the anchor now: it must still be
+    // the block at the same height. Looking it up by hash hits the block-hash index only, so this costs a single get.
+    if (anchor?.hash) {
+      const currentNumber = await this.blockStore.getBlockNumber({ hash: anchor.hash });
+      if (currentNumber !== anchor.blockNumber) {
+        return undefined;
       }
     }
 
@@ -343,11 +394,15 @@ export class LogStore {
   async #resolveReferenceBlockNumber(referenceBlock: BlockHash): Promise<number> {
     const block = await this.blockStore.getBlockData({ hash: referenceBlock });
     if (!block) {
-      throw new Error(
-        `Reference block ${referenceBlock.toString()} not found in the node. This might indicate a reorg has occurred.`,
-      );
+      throw LogStore.#referenceBlockNotFoundError(referenceBlock);
     }
     return block.header.globalVariables.blockNumber;
+  }
+
+  static #referenceBlockNotFoundError(referenceBlock: BlockHash): Error {
+    return new Error(
+      `Reference block ${referenceBlock.toString()} not found in the node. This might indicate a reorg has occurred.`,
+    );
   }
 
   /**

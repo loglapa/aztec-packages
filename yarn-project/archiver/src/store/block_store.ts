@@ -1239,6 +1239,18 @@ export class BlockStore {
   }
 
   /**
+   * Number and hash of the highest L2 block in the store, or undefined if it holds no blocks yet. Reads the stored
+   * hash off the latest block entry in a single cursor read, so it neither deserializes the header nor re-hashes it.
+   */
+  async getLatestBlockTip(): Promise<{ blockNumber: BlockNumber; blockHash: BlockHash } | undefined> {
+    const [latest] = await toArray(this.#blocks.entriesAsync({ reverse: true, limit: 1 }));
+    if (!latest) {
+      return undefined;
+    }
+    return { blockNumber: BlockNumber(latest[0]), blockHash: BlockHash.fromBuffer(latest[1].blockHash) };
+  }
+
+  /**
    * Resolves all four L2 chain tips (proposed, checkpointed, proven, finalized) in a single
    * read-only transaction so the snapshot is internally consistent. Each underlying record is
    * read at most once: latest block and latest confirmed checkpoint are loaded directly (no
