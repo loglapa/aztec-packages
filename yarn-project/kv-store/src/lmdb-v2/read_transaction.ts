@@ -1,4 +1,4 @@
-import { CURSOR_PAGE_SIZE, Database, type LMDBMessageChannel, LMDBMessageType } from './message.js';
+import { CURSOR_PAGE_SIZE, Database, type LMDBMessageChannel, LMDBMessageType, SINGLE_PAGE_LIMIT } from './message.js';
 
 export class ReadTransaction {
   protected open = true;
@@ -68,11 +68,14 @@ export class ReadTransaction {
 
     let cursor: number | undefined;
     try {
+      // A bounded scan asks for the whole limit up front: `endKey` is filtered client side but in-range entries are
+      // contiguous from `startKey`, so the first `limit` entries always contain every entry we may return.
+      const singlePageLimit = typeof limit === 'number' && limit <= SINGLE_PAGE_LIMIT ? limit : undefined;
       const response = await this.channel.sendMessage(LMDBMessageType.START_CURSOR, {
         key: startKey,
         reverse,
-        count: typeof limit === 'number' ? Math.min(limit, CURSOR_PAGE_SIZE) : CURSOR_PAGE_SIZE,
-        onePage: typeof limit === 'number' && limit < CURSOR_PAGE_SIZE,
+        count: singlePageLimit ?? CURSOR_PAGE_SIZE,
+        onePage: singlePageLimit !== undefined,
         db,
       });
 

@@ -5,6 +5,13 @@ export enum Database {
 
 export const CURSOR_PAGE_SIZE = 10;
 
+/**
+ * Largest `limit` that an iteration will ask the native side to return in a single page. Bounded scans up to this
+ * size are answered by one START_CURSOR round trip with no cursor left open, so they neither pay for
+ * ADVANCE_CURSOR/CLOSE_CURSOR nor hold one of the store's limited cursor slots.
+ */
+export const SINGLE_PAGE_LIMIT = 128;
+
 export enum LMDBMessageType {
   OPEN_DATABASE = 100,
   GET,
